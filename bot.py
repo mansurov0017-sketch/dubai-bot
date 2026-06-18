@@ -13,6 +13,7 @@ from datetime import datetime
 import pytz
 
 import anthropic
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -31,16 +32,52 @@ from apscheduler.triggers.cron import CronTrigger
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+UNSPLASH_ACCESS_KEY = os.environ["UNSPLASH_ACCESS_KEY"]
 OWNER_CHAT_ID = os.environ["OWNER_CHAT_ID"]  # Sizning shaxsiy Telegram chat ID'ingiz
 CHANNEL_USERNAME = os.environ["CHANNEL_USERNAME"]  # masalan: @dubai_realestate_uz
 
 # Kunlik post mavzulari va vaqtlari (Dubai vaqti, Asia/Dubai)
 # Har birini xohlagancha o'zgartirishingiz mumkin
-POST_SCHEDULE = [
-    {"hour": 9, "minute": 0, "topic": "real_estate"},
-    {"hour": 14, "minute": 0, "topic": "markets"},
-    {"hour": 19, "minute": 0, "topic": "political_economic"},
-]
+POST_TIMES = [9, 14, 19]  # Dubai vaqti bo'yicha, har kuni shu 3 vaqtda post chiqadi
+
+# Haftaning har kuni uchun 3 ta mavzu tartibi (0=Dushanba ... 6=Yakshanba)
+# 5 mavzu rotatsiya qiladi, shunda har biri haftada bir necha marta chiqadi
+WEEKLY_TOPIC_ROTATION = {
+    0: ["real_estate", "markets", "political_economic"],          # Dushanba
+    1: ["investment_insight", "real_estate", "sales_tips"],        # Seshanba
+    2: ["markets", "political_economic", "real_estate"],           # Chorshanba
+    3: ["sales_tips", "investment_insight", "markets"],            # Payshanba
+    4: ["real_estate", "political_economic", "investment_insight"],# Juma
+    5: ["markets", "sales_tips", "real_estate"],                   # Shanba
+    6: ["investment_insight", "real_estate", "political_economic"],# Yakshanba
+}
+
+TOPIC_IMAGE_QUERIES = {
+    "real_estate": "Dubai skyline luxury real estate",
+    "markets": "stock market finance trading",
+    "political_economic": "Dubai UAE government business",
+    "investment_insight": "real estate investment growth",
+    "sales_tips": "handshake real estate deal",
+}
+
+
+def get_unsplash_image(topic_key: str) -> str | None:
+    """Unsplash API orqali mavzuga mos rasm URL'ini qaytaradi."""
+    query = TOPIC_IMAGE_QUERIES.get(topic_key, "Dubai real estate")
+    try:
+        response = requests.get(
+            "https://api.unsplash.com/photos/random",
+            params={"query": query, "orientation": "landscape"},
+            headers={"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["urls"]["regular"]
+    except Exception:
+        logger.exception("Unsplash rasm olishda xato")
+        return None
+
 
 TOPIC_PROMPTS = {
     "real_estate": (
@@ -60,21 +97,36 @@ TOPIC_PROMPTS = {
         "munosabatlar) internetdan qidirib top va buning ko'chmas mulk bozoriga "
         "ta'sirini tushuntir."
     ),
+    "investment_insight": (
+        "Dubai ko'chmas mulkiga investitsiya qilish bo'yicha foydali, amaliy insight "
+        "tayyorla. Internetdan eng so'nggi ROI ko'rsatkichlari, ijara daromadi (rental "
+        "yield), eng istiqbolli rayonlar, yoki xalqaro investorlar uchun foydali "
+        "soliq/qonunchilik yangiliklarini qidirib top. Maqsad - potensial investorga "
+        "aniq raqamlar va amaliy maslahat berish."
+    ),
+    "sales_tips": (
+        "Ko'chmas mulk sotish/sotib olish jarayoni haqida foydali, amaliy maslahat "
+        "yoki insight tayyorla (masalan: muzokara strategiyalari, hujjatlashtirish "
+        "bosqichlari, narx belgilash psixologiyasi, off-plan vs ready property "
+        "tanlash mezonlari). Internetdan dolzarb Dubai bozor amaliyotlarini qidirib, "
+        "shu asosda klientlar uchun foydali kontent yarat."
+    ),
 }
 
 SYSTEM_PROMPT = """Sen Dubayda ishlaydigan tajribali realtor uchun Telegram kanal kontentini yozadigan yordamchisan. Kanal auditoriyasi - potensial va mavjud klientlar, ko'chmas mulkka qiziqqan investorlar.
 
-Vazifang: berilgan mavzu bo'yicha internetdan eng so'nggi va dolzarb ma'lumotni qidirib topish, so'ngra O'ZBEK TILIDA professional, ishonchli va qiziqarli Telegram post matnini yozish.
+Vazifang: berilgan mavzu bo'yicha internetdan eng so'nggi va dolzarb ma'lumotni qidirib topish, so'ngra O'ZBEK TILIDA professional, ishonchli va vizual jihatdan jozibali Telegram post matnini yozish.
 
 Post talablari:
 - Faqat o'zbek tilida (lotin alifbosida)
-- Professional, lekin tushunarli til - murakkab moliyaviy terminlarni oddiy so'zlar bilan tushuntir
+- Professional, ishonchli ohang - murakkab moliyaviy terminlarni oddiy so'zlar bilan tushuntir
 - Aniq raqamlar va faktlarga asoslangan (sana, foiz, summalar)
-- Telegram uchun mos formatda: qisqa paragraflar, kerak bo'lsa emoji (lekin oshirib yubormasdan, 2-4 ta yetarli)
-- Oxirida qisqa tahlil yoki "bu nima uchun muhim" degan amaliy xulosa (realtor nuqtai nazaridan)
+- Boshida mavzuga mos 1 ta sarlavha emoji bilan boshlanadigan qisqa, diqqatni tortuvchi sarlavha qatori (masalan: "🏙️ Dubai Real Estate Pulse" yoki "📊 Bozor Tahlili")
+- Matn ichida har bir asosiy fikr/band oldida mos emoji ishlatilsin (📈 📉 💰 🏗️ 🔑 ⚡️ kabi), lekin ortiqcha ishlatmasdan - har bandda bittadan yetarli
+- Qisqa paragraflar, oson o'qiladigan struktura
 - Uzunligi: 80-150 so'z atrofida (Telegram'da o'qilishi oson bo'lishi uchun)
 - Manba havolasi yoki nomini oxirida kichik shrift kabi ko'rsat (masalan: "Manba: Bloomberg")
-- HECH QANDAY sarlavha-prefiks yoki "Mana post:" kabi metaizoh yozmang - faqat tayyor post matnini ber
+- HECH QANDAY "Mana post:" kabi metaizoh yozmang - faqat tayyor post matnini ber
 - Faktlarni ixtiro qilma - agar aniq ma'lumot topa olmasang, buni ayt va eng yaqin ishonchli ma'lumotni ber
 
 Javobing FAQAT tayyor Telegram post matni bo'lishi kerak, boshqa hech narsa qo'shma."""
@@ -149,7 +201,8 @@ async def manual_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         post_text = generate_post(topic_key="real_estate", custom_topic=custom_topic)
-        await send_for_approval(context, post_text)
+        image_url = get_unsplash_image("real_estate")
+        await send_for_approval(context, post_text, image_url)
     except Exception as e:
         logger.exception("Post generatsiyasida xato")
         await update.message.reply_text(f"❌ Xato yuz berdi: {e}")
@@ -161,16 +214,17 @@ async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Test posti tayyorlanmoqda...")
     try:
         post_text = generate_post(topic_key="real_estate")
-        await send_for_approval(context, post_text)
+        image_url = get_unsplash_image("real_estate")
+        await send_for_approval(context, post_text, image_url)
     except Exception as e:
         logger.exception("Test postida xato")
         await update.message.reply_text(f"❌ Xato yuz berdi: {e}")
 
 
-async def send_for_approval(context: ContextTypes.DEFAULT_TYPE, post_text: str):
-    """Tayyor postni owner'ga tasdiqlash tugmalari bilan yuboradi."""
+async def send_for_approval(context: ContextTypes.DEFAULT_TYPE, post_text: str, image_url: str = None):
+    """Tayyor postni owner'ga tasdiqlash tugmalari bilan yuboradi (rasm bilan, agar mavjud bo'lsa)."""
     post_id = str(datetime.now().timestamp())
-    pending_posts[post_id] = post_text
+    pending_posts[post_id] = {"text": post_text, "image_url": image_url}
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -181,9 +235,23 @@ async def send_for_approval(context: ContextTypes.DEFAULT_TYPE, post_text: str):
         ]
     )
 
+    caption = f"📝 Yangi post tayyor:\n\n{post_text}"
+
+    if image_url:
+        try:
+            await context.bot.send_photo(
+                chat_id=OWNER_CHAT_ID,
+                photo=image_url,
+                caption=caption,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            logger.exception("Rasm bilan yuborishda xato, faqat matn yuboriladi")
+
     await context.bot.send_message(
         chat_id=OWNER_CHAT_ID,
-        text=f"📝 Yangi post tayyor:\n\n{post_text}",
+        text=caption,
         reply_markup=keyboard,
     )
 
@@ -193,36 +261,64 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     action, post_id = query.data.split(":", 1)
-    post_text = pending_posts.get(post_id)
+    post_data = pending_posts.get(post_id)
 
-    if not post_text:
-        await query.edit_message_text("⚠️ Bu post muddati o'tgan yoki allaqachon ishlov berilgan.")
+    if not post_data:
+        await _safe_edit(query, "⚠️ Bu post muddati o'tgan yoki allaqachon ishlov berilgan.")
         return
+
+    post_text = post_data["text"]
+    image_url = post_data.get("image_url")
 
     if action == "approve":
         try:
-            await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post_text)
-            await query.edit_message_text(f"✅ Kanalga joylandi:\n\n{post_text}")
+            if image_url:
+                try:
+                    await context.bot.send_photo(chat_id=CHANNEL_USERNAME, photo=image_url, caption=post_text)
+                except Exception:
+                    logger.exception("Kanalga rasm bilan joylashda xato, faqat matn yuboriladi")
+                    await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post_text)
+            else:
+                await context.bot.send_message(chat_id=CHANNEL_USERNAME, text=post_text)
+            await _safe_edit(query, f"✅ Kanalga joylandi:\n\n{post_text}")
         except Exception as e:
             logger.exception("Kanalga joylashda xato")
-            await query.edit_message_text(f"❌ Kanalga joylashda xato: {e}")
+            await _safe_edit(query, f"❌ Kanalga joylashda xato: {e}")
         finally:
             pending_posts.pop(post_id, None)
 
     elif action == "reject":
-        await query.edit_message_text("❌ Bekor qilindi.")
+        await _safe_edit(query, "❌ Bekor qilindi.")
         pending_posts.pop(post_id, None)
+
+
+async def _safe_edit(query, new_text: str):
+    """Xabar matn yoki rasm (caption) bo'lishidan qat'i nazar, to'g'ri tahrirlaydi."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(caption=new_text)
+        else:
+            await query.edit_message_text(new_text)
+    except Exception:
+        logger.exception("Xabarni tahrirlashda xato")
 
 
 # ---------------------------------------------------------------------------
 # Rejalashtirilgan (scheduled) postlar
 # ---------------------------------------------------------------------------
 
-async def scheduled_post_job(application: Application, topic_key: str):
-    logger.info(f"Rejalashtirilgan post boshlandi: {topic_key}")
+async def scheduled_post_job(application: Application, slot_index: int):
+    """slot_index: 0, 1 yoki 2 - kunlik 3 vaqtdan (09:00/14:00/19:00) qaysi biri ekanini bildiradi.
+    Bugungi haftaning kuniga qarab to'g'ri mavzu WEEKLY_TOPIC_ROTATION'dan tanlanadi."""
+    dubai_tz = pytz.timezone("Asia/Dubai")
+    weekday = datetime.now(dubai_tz).weekday()  # 0=Dushanba ... 6=Yakshanba
+    topic_key = WEEKLY_TOPIC_ROTATION[weekday][slot_index]
+
+    logger.info(f"Rejalashtirilgan post boshlandi: kun={weekday}, slot={slot_index}, mavzu={topic_key}")
     try:
         post_text = generate_post(topic_key=topic_key)
-        await send_for_approval(application, post_text)
+        image_url = get_unsplash_image(topic_key)
+        await send_for_approval(application, post_text, image_url)
     except Exception as e:
         logger.exception("Rejalashtirilgan postda xato")
         try:
@@ -237,17 +333,17 @@ async def scheduled_post_job(application: Application, topic_key: str):
 def setup_scheduler(application: Application):
     scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Dubai"))
 
-    for slot in POST_SCHEDULE:
+    for slot_index, hour in enumerate(POST_TIMES):
         scheduler.add_job(
             scheduled_post_job,
-            trigger=CronTrigger(hour=slot["hour"], minute=slot["minute"]),
-            args=[application, slot["topic"]],
-            id=f"post_{slot['topic']}_{slot['hour']}",
+            trigger=CronTrigger(hour=hour, minute=0),
+            args=[application, slot_index],
+            id=f"post_slot_{slot_index}_{hour}",
             misfire_grace_time=3600,
         )
 
     scheduler.start()
-    logger.info("Scheduler ishga tushdi. Rejalashtirilgan postlar: %s", POST_SCHEDULE)
+    logger.info("Scheduler ishga tushdi. Kunlik vaqtlar: %s", POST_TIMES)
     return scheduler
 
 
